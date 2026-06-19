@@ -1,0 +1,25 @@
+# Build context excludes — keep the image lean and free of host artifacts/secrets.
+.venv/
+__pycache__/
+*.py[cod]
+.import_cache/
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+test_import.xlsx
+
+# Secrets (real env never goes into the image; Dokploy injects env vars at runtime)
+.env
+.env.*
+!.env.example
+
+# VCS / tooling
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
