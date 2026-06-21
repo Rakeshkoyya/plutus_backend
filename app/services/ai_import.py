@@ -17,8 +17,12 @@ TARGET_FIELDS = {
         "father_name", "father_phone", "mother_name", "mother_phone", "phone",
         # fees
         "total_fee", "fee_after_discount", "discount", "opening_dues",
-        # collections — either a single paid amount, or per-quarter collected amounts
-        "paid_amount", "q1_paid", "q2_paid", "q3_paid", "q4_paid",
+        # per-quarter installment AMOUNTS — the schedule (e.g. "1st QTR Due"). When
+        # present these become the student's installments directly.
+        "q1_amount", "q2_amount", "q3_amount", "q4_amount",
+        # collections — a single paid amount, the outstanding balance (paid is then
+        # derived as payable − due), or per-quarter collected amounts ("1st QTR Paid").
+        "paid_amount", "total_due", "q1_paid", "q2_paid", "q3_paid", "q4_paid",
         "receipt_number",
     ],
     "fee_structures": [
@@ -26,8 +30,11 @@ TARGET_FIELDS = {
     ],
 }
 
+# Per-quarter installment AMOUNT columns — they define the installment schedule
+# (what each quarter is billed), paired index-for-index with the "paid" columns.
+QUARTER_AMOUNT_FIELDS = ["q1_amount", "q2_amount", "q3_amount", "q4_amount"]
 # Quarter "paid/received" columns the importer recognises as quarterly collections.
-QUARTER_FIELDS = ["q1_paid", "q2_paid", "q3_paid", "q4_paid"]
+QUARTER_PAID_FIELDS = ["q1_paid", "q2_paid", "q3_paid", "q4_paid"]
 QUARTER_LABELS = ["1st Quarter", "2nd Quarter", "3rd Quarter", "4th Quarter"]
 
 FIELD_HINTS = {
@@ -46,11 +53,20 @@ FIELD_HINTS = {
     "fee_after_discount": ["fee after discount", "net fee", "payable", "after discount"],
     "discount": ["discount", "concession", "waiver", "scholarship"],
     "opening_dues": ["last yr due", "last year due", "previous due", "arrears", "old due", "opening"],
-    "paid_amount": ["paid", "amount paid", "received", "collected", "total paid"],
-    "q1_paid": ["1st qtr paid", "1st qtr received", "q1 paid", "1st quarter", "qtr 1"],
-    "q2_paid": ["2nd qtr paid", "2nd qtr received", "q2 paid", "2nd quarter", "qtr 2"],
-    "q3_paid": ["3rd qtr paid", "3rd qtr received", "q3 paid", "3rd quarter", "qtr 3"],
-    "q4_paid": ["4th qtr paid", "4th qtr received", "q4 paid", "4th quarter", "qtr 4"],
+    # Per-quarter installment amounts — the school's "QTR Due" columns are the
+    # scheduled amount for that quarter, not a payment.
+    "q1_amount": ["1st qtr due", "1st quarter due", "1st installment", "q1 due", "qtr 1 due", "1st term fee", "first installment"],
+    "q2_amount": ["2nd qtr due", "2nd quarter due", "2nd installment", "q2 due", "qtr 2 due", "2nd term fee", "second installment"],
+    "q3_amount": ["3rd qtr due", "3rd quarter due", "3rd installment", "q3 due", "qtr 3 due", "3rd term fee", "third installment"],
+    "q4_amount": ["4th qtr due", "4th quarter due", "4th installment", "q4 due", "qtr 4 due", "4th term fee", "fourth installment"],
+    "paid_amount": ["amount paid", "total paid", "paid amount", "received", "collected", "paid"],
+    # Outstanding balance — when there is no "paid" column we derive collected as
+    # payable − this. Kept specific so it never grabs a "1st QTR Due" column.
+    "total_due": ["total dues", "total due", "balance due", "net due", "amount due", "outstanding", "balance"],
+    "q1_paid": ["1st qtr paid", "1st qtr received", "q1 paid", "1st quarter paid", "qtr 1 paid"],
+    "q2_paid": ["2nd qtr paid", "2nd qtr received", "q2 paid", "2nd quarter paid", "qtr 2 paid"],
+    "q3_paid": ["3rd qtr paid", "3rd qtr received", "q3 paid", "3rd quarter paid", "qtr 3 paid"],
+    "q4_paid": ["4th qtr paid", "4th qtr received", "q4 paid", "4th quarter paid", "qtr 4 paid"],
     "receipt_number": ["payment details", "receipt", "receipt no", "receipt number", "fr no", "voucher"],
     "academic_year": ["academic year", "year", "session", "ay"],
     "total_amount": ["total fee", "total amount", "total", "fee", "amount"],
@@ -206,6 +222,16 @@ def heuristic_mapping(columns: list[str]) -> dict[str, Any]:
     # separate discount column — the discount is derived from total − net instead.
     if students.get("discount") and students.get("discount") == students.get("fee_after_discount"):
         students.pop("discount", None)
+    # Per-quarter "Paid" columns are more specific than a single paid_amount. If the
+    # generic heuristic latched onto a quarter-paid or an admission-fee-paid column,
+    # drop paid_amount so collections aren't double-counted at commit time.
+    qpaid_cols = {students.get(f) for f in QUARTER_PAID_FIELDS if students.get(f)}
+    pa = students.get("paid_amount")
+    if pa and (pa in qpaid_cols or any(t in pa.lower() for t in ("adm", "qtr", "quarter"))):
+        students.pop("paid_amount", None)
+    # Likewise total_due must not also be claimed as the annual total_fee.
+    if students.get("total_due") and students.get("total_due") == students.get("total_fee"):
+        students.pop("total_fee", None)
     structures = {f: find(f) for f in TARGET_FIELDS["fee_structures"]}
     structures = {k: v for k, v in structures.items() if v}
 
@@ -232,6 +258,15 @@ TARGET ENTITIES & FIELDS:
 1. "students_fees" (one row per student with their fee): {TARGET_FIELDS['students_fees']}
    - name is REQUIRED for this entity.
 2. "fee_structures" (per-class fee template): {TARGET_FIELDS['fee_structures']}
+
+FIELD NOTES (important for sheets that track dues rather than payments):
+- admission_number / roll_number are identifiers and may be text (e.g. "25/93"), not numbers.
+- A spreadsheet often has NO "total paid" column. If it has an outstanding/balance column
+  (e.g. "Total Dues"), map it to total_due — we compute paid = (net fee + opening dues) − due.
+- "1st QTR", "1st QTR Due", "1st Installment" etc. are the SCHEDULED amount for that quarter →
+  map to q1_amount..q4_amount. These define the student's installments.
+- "1st QTR Paid", "1st QTR Received" etc. are amounts COLLECTED for that quarter →
+  map to q1_paid..q4_paid. Do NOT confuse the "Due"/scheduled columns with the "Paid" columns.
 
 SHEET NAME: {sheet_name}
 COLUMNS: {columns}
