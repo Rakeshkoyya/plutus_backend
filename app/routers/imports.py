@@ -27,8 +27,9 @@ from app.schemas import (
     ImportCommitOut,
 )
 from app.services.ai_import import (
-    QUARTER_FIELDS,
+    QUARTER_AMOUNT_FIELDS,
     QUARTER_LABELS,
+    QUARTER_PAID_FIELDS,
     ai_mapping,
     build_year_options,
     detect_academic_year,
@@ -51,6 +52,21 @@ def _num(v) -> Decimal:
         return q(Decimal(cleaned))
     except (InvalidOperation, ValueError):
         return Decimal("0")
+
+
+def _clean_str(v) -> str | None:
+    """Render a cell as a clean string for identifier/text fields.
+
+    openpyxl reads numeric cells as floats, so an admission number "713" or a phone
+    number arrives as 713.0; we strip the trailing ".0". Text identifiers like "25/93"
+    pass through untouched, so admission/roll numbers may be either form.
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    s = str(v).strip()
+    return s or None
 
 
 @router.get("/enabled")
@@ -165,7 +181,7 @@ async def commit(
         if sel.entity == "students_fees":
             for raw in sheet["rows"]:
                 name_col = mapping.get("name")
-                name = str(raw.get(name_col)).strip() if name_col and raw.get(name_col) else ""
+                name = (_clean_str(raw.get(name_col)) if name_col else None) or ""
                 if not name:
                     result.skipped += 1
                     continue
@@ -191,11 +207,11 @@ async def commit(
                 result.students_created += 1
 
                 # Fee amounts: prefer explicit total + fee-after-discount, else derive.
+                # discount is recomputed from total − net once installments are built.
                 total = _num(raw.get(mapping.get("total_fee"))) if mapping.get("total_fee") else Decimal("0")
                 fad = _num(raw.get(mapping.get("fee_after_discount"))) if mapping.get("fee_after_discount") else None
                 discount = _num(raw.get(mapping.get("discount"))) if mapping.get("discount") else Decimal("0")
                 if fad is not None and fad > 0 and total > 0 and fad <= total:
-                    discount = q(total - fad)
                     net = fad
                 elif fad is not None and fad > 0 and total <= 0:
                     total = fad
@@ -204,24 +220,18 @@ async def commit(
                     net = q(total - discount)
                 opening = _num(raw.get(mapping.get("opening_dues"))) if mapping.get("opening_dues") else Decimal("0")
 
+                # Build the installment schedule from the row (per-quarter columns when
+                # present) and apply collections. ``net`` may rise to cover an explicit
+                # quarter schedule, so total/discount are reconciled afterwards.
+                inst_rows, net = _build_installments(raw, mapping, net, opening)
+                if net > total:
+                    total = net
+                discount = q(total - net) if total > net else Decimal("0")
+
                 # Skip rows with no money at all (likely blank/placeholder rows).
                 if total <= 0 and opening <= 0:
                     continue
 
-                # Total collected: sum of mapped quarter columns, else single paid_amount.
-                quarter_cols = [f for f in QUARTER_FIELDS if mapping.get(f)]
-                if quarter_cols:
-                    total_paid = q(sum(_num(raw.get(mapping[f])) for f in quarter_cols))
-                    inst_rows = [
-                        Installment(installment_number=i + 1, label=QUARTER_LABELS[i], amount=amt, due_date=None)
-                        for i, amt in enumerate(even_split(net, 4))
-                    ]
-                else:
-                    total_paid = _num(raw.get(mapping.get("paid_amount"))) if mapping.get("paid_amount") else Decimal("0")
-                    inst_rows = [Installment(installment_number=1, amount=net, paid_amount=Decimal("0"), due_date=None)]
-
-                total_paid = max(total_paid, Decimal("0"))
-                _waterfall(inst_rows, total_paid)
                 applied_paid = q(sum(q(i.paid_amount) for i in inst_rows))
 
                 sf = StudentFee(
@@ -298,10 +308,86 @@ def _get(raw: dict, mapping: dict, field: str):
     col = mapping.get(field)
     if not col:
         return None
-    v = raw.get(col)
-    if v is None or str(v).strip() == "":
-        return None
-    return str(v).strip()
+    return _clean_str(raw.get(col))
+
+
+def _build_installments(
+    raw: dict, mapping: dict, net: Decimal, opening: Decimal
+) -> tuple[list[Installment], Decimal]:
+    """Build a student's installments (amounts + paid) from one spreadsheet row.
+
+    Schedule (installment amounts):
+      1. Per-quarter AMOUNT columns ("1st QTR Due", "1st Installment", ...) → one
+         installment per used quarter with that amount. ``net`` is raised to cover them,
+         and a trailing "Balance" line is added if the quarters under-cover ``net``.
+      2. Only per-quarter PAID columns → an even 4-way split of ``net``.
+      3. Otherwise → a single lump installment for ``net``.
+
+    Collected total (precedence — the school tracks dues, so balance wins):
+      1. total_due (outstanding) → paid = (net + opening) − due, distributed by waterfall.
+      2. Per-quarter PAID columns → applied onto the matching quarter installment.
+      3. A single paid_amount → distributed by waterfall.
+
+    Returns (installments, net) with ``net`` possibly raised to cover the schedule.
+    """
+    has_amounts = any(mapping.get(f) for f in QUARTER_AMOUNT_FIELDS)
+    has_paid = any(mapping.get(f) for f in QUARTER_PAID_FIELDS)
+
+    rows: list[Installment] = []
+    quarter_paid: list[Decimal] = []  # paid value parallel to rows, for per-quarter attribution
+
+    if has_amounts:
+        for i in range(4):
+            amt_col = mapping.get(QUARTER_AMOUNT_FIELDS[i])
+            paid_col = mapping.get(QUARTER_PAID_FIELDS[i])
+            amt = _num(raw.get(amt_col)) if amt_col else Decimal("0")
+            paid = _num(raw.get(paid_col)) if paid_col else Decimal("0")
+            if amt <= 0 and paid <= 0:
+                continue  # quarter unused for this student
+            if amt <= 0:  # collected into a quarter with no scheduled amount
+                amt = paid
+            rows.append(
+                Installment(installment_number=len(rows) + 1, label=QUARTER_LABELS[i], amount=q(amt), due_date=None)
+            )
+            quarter_paid.append(q(max(paid, Decimal("0"))))
+
+    if not rows and has_paid:  # even split, with each quarter's collection kept
+        for i, amt in enumerate(even_split(net, 4)):
+            paid_col = mapping.get(QUARTER_PAID_FIELDS[i])
+            paid = _num(raw.get(paid_col)) if paid_col else Decimal("0")
+            rows.append(Installment(installment_number=i + 1, label=QUARTER_LABELS[i], amount=amt, due_date=None))
+            quarter_paid.append(q(max(paid, Decimal("0"))))
+
+    if not rows:  # single lump
+        rows.append(Installment(installment_number=1, amount=q(net), due_date=None))
+        quarter_paid.append(Decimal("0"))
+
+    # Make ``net`` cover the schedule: trust an explicit quarter schedule, and top up
+    # with a balance line when the quarters under-cover the fee.
+    scheduled = q(sum(q(r.amount) for r in rows))
+    if has_amounts and rows:
+        if net <= 0 or scheduled > net:
+            net = scheduled
+        elif net - scheduled > Decimal("0.50"):
+            rows.append(Installment(installment_number=len(rows) + 1, label="Balance", amount=q(net - scheduled), due_date=None))
+            quarter_paid.append(Decimal("0"))
+    elif net <= 0:
+        net = scheduled
+    schedule_total = q(sum(q(r.amount) for r in rows))
+
+    # Apply collections by precedence.
+    if mapping.get("total_due"):
+        due = _num(raw.get(mapping["total_due"]))
+        collected = max(min(q(net + opening - due), schedule_total), Decimal("0"))
+        _waterfall(rows, collected)
+    elif has_paid:
+        for inst, paid in zip(rows, quarter_paid):
+            inst.paid_amount = q(min(paid, q(inst.amount)))
+    elif mapping.get("paid_amount"):
+        collected = max(min(_num(raw.get(mapping["paid_amount"])), schedule_total), Decimal("0"))
+        _waterfall(rows, collected)
+
+    return rows, net
 
 
 def _waterfall(installments: list[Installment], total_paid: Decimal) -> None:
